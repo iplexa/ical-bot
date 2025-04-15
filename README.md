@@ -7,8 +7,8 @@
 
 1. Клонируйте репозиторий:
 ```
-git clone <url-репозитория>
-cd <папка-проекта>
+git clone https://github.com/iplexa/ical-bot
+cd ical-bot
 ```
 
 2. Установите зависимости:
