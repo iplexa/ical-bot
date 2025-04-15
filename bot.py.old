@@ -1,0 +1,829 @@
+import asyncio
+import logging
+import datetime
+from typing import Dict, List, Optional, Union
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.utils.exceptions import MessageNotModified
+
+from dateutil import tz
+from sqlalchemy.orm import Session
+
+# Импортируем конфигурацию и утилиты для работы с календарем
+from config import BOT_TOKEN, CHECK_INTERVAL, NOTIFICATION_TIME, OWNER_ID
+from calendar_utils import fetch_calendar, get_events, format_events_text
+from models import User, Calendar, init_db, SessionLocal
+from db_utils import get_or_create_user, update_user_subscription, set_user_admin, get_all_subscribed_users, get_calendar, create_or_update_calendar
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+# Инициализация базы данных
+init_db()
+
+# Определение состояний для FSM
+class CalendarStates(StatesGroup):
+    waiting_for_calendar_url = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_admin_id = State()
+
+# Создание клавиатуры для главного меню
+def get_main_keyboard(user: User = None, has_calendar: bool = False) -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    
+    if has_calendar:
+        # Кнопки для просмотра событий
+        keyboard.add(
+            InlineKeyboardButton("События на сегодня", callback_data="events_1"),
+            InlineKeyboardButton("События на 3 дня", callback_data="events_3"),
+            InlineKeyboardButton("События на неделю", callback_data="events_7")
+        )
+        
+        # Кнопка подписки/отписки
+        is_subscribed = user.is_subscribed if user else False
+        sub_text = "Отключить уведомления" if is_subscribed else "Включить уведомления"
+        sub_data = "unsubscribe" if is_subscribed else "subscribe"
+        keyboard.add(InlineKeyboardButton(sub_text, callback_data=sub_data))
+        
+        # Кнопки для администраторов и владельца
+        if user and (user.is_admin or user.is_owner):
+            keyboard.add(InlineKeyboardButton("Изменить календарь", callback_data="change_calendar"))
+            
+            # Кнопка для владельца (управление администраторами)
+            if user.is_owner:
+                keyboard.add(InlineKeyboardButton("Управление администраторами", callback_data="manage_admins"))
+    else:
+        # Кнопка для добавления календаря (только для админов и владельца)
+        if user and (user.is_admin or user.is_owner):
+            keyboard.add(InlineKeyboardButton("Добавить календарь", callback_data="add_calendar"))
+        else:
+            keyboard.add(InlineKeyboardButton("Запросить доступ к календарю", callback_data="request_calendar"))
+    
+    return keyboard
+
+# Обработчик команды /start
+@dp.message_handler(commands=['start'], state='*')
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    user_id = message.from_user.id
+    
+    # Получаем или создаем пользователя в базе данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(
+            db, 
+            user_id, 
+            message.from_user.username, 
+            message.from_user.first_name, 
+            message.from_user.last_name
+        )
+        
+        # Проверяем, есть ли календарь в базе данных
+        calendar = get_calendar(db)
+        has_calendar = calendar is not None
+        
+        text = "Привет! Я бот для работы с календарями в формате iCal.\n\n"
+        
+        if has_calendar:
+            text += "Календарь уже добавлен. Выберите действие:"
+        else:
+            if user.is_admin or user.is_owner:
+                text += "Для начала работы добавьте ссылку на iCal календарь."
+            else:
+                text += "Ожидайте, когда администратор добавит календарь."
+        
+        await message.answer(
+            text,
+            reply_markup=get_main_keyboard(user, has_calendar)
+        )
+    finally:
+        db.close()
+
+# Обработчик для добавления календаря
+@dp.callback_query_handler(lambda c: c.data == 'add_calendar' or c.data == 'change_calendar', state='*')
+async def process_add_calendar(callback_query: CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Проверяем права доступа
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        if not user.is_admin and not user.is_owner:
+            await bot.edit_message_text(
+                "У вас нет прав для изменения календаря.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, get_calendar(db) is not None)
+            )
+            return
+        
+        text = "Пожалуйста, отправьте ссылку на iCal календарь."
+        await bot.edit_message_text(
+            text,
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("Отмена", callback_data="cancel")
+            )
+        )
+        
+        await CalendarStates.waiting_for_calendar_url.set()
+    finally:
+        db.close()
+
+# Обработчик для отмены операции
+@dp.callback_query_handler(lambda c: c.data == 'cancel', state='*')
+async def process_cancel(callback_query: CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    await state.finish()
+    
+    user_id = callback_query.from_user.id
+    
+    # Получаем данные пользователя из БД
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        calendar = get_calendar(db)
+        
+        text = "Операция отменена. Выберите действие:"
+        await bot.edit_message_text(
+            text,
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(user, calendar is not None)
+        )
+    finally:
+        db.close()
+
+# Обработчик для получения URL календаря
+@dp.message_handler(state=CalendarStates.waiting_for_calendar_url)
+async def process_calendar_url(message: types.Message, state: FSMContext):
+    url = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Проверяем URL
+    if not url.startswith(('http://', 'https://')):
+        await message.answer(
+            "Пожалуйста, отправьте корректную ссылку на календарь, начинающуюся с http:// или https://",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("Отмена", callback_data="cancel")
+            )
+        )
+        return
+    
+    # Пробуем загрузить календарь
+    calendar = await fetch_calendar(url)
+    if not calendar:
+        await message.answer(
+            "Не удалось загрузить календарь по указанной ссылке. Пожалуйста, проверьте ссылку и попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("Отмена", callback_data="cancel")
+            )
+        )
+        return
+    
+    # Сохраняем URL календаря в базу данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, message.from_user.username,
+                                message.from_user.first_name, message.from_user.last_name)
+        
+        # Создаем или обновляем календарь
+        create_or_update_calendar(db, url, user_id)
+        
+        await state.finish()
+        
+        # Отправляем сообщение с подтверждением
+        sent_message = await message.answer(
+            "Календарь успешно добавлен! Выберите действие:",
+            reply_markup=get_main_keyboard(user, True)
+        )
+        
+        # Удаляем сообщение с URL для безопасности
+        await message.delete()
+    finally:
+        db.close()
+
+# Обработчик для просмотра событий
+@dp.callback_query_handler(lambda c: c.data.startswith('events_'))
+async def process_show_events(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Получаем данные из базы данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        # Проверяем, есть ли календарь
+        calendar_obj = get_calendar(db)
+        if not calendar_obj:
+            await bot.edit_message_text(
+                "Сначала добавьте календарь.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, False)
+            )
+            return
+        
+        # Определяем период
+        days = int(callback_query.data.split('_')[1])
+        start_date = datetime.datetime.now(tz.tzlocal())
+        end_date = start_date + datetime.timedelta(days=days)
+        
+        # Загружаем календарь
+        calendar = await fetch_calendar(calendar_obj.url)
+        if not calendar:
+            await bot.edit_message_text(
+                "Не удалось загрузить календарь. Пожалуйста, проверьте ссылку и попробуйте снова.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, True)
+            )
+            return
+    finally:
+        db.close()
+    
+    # Получаем события
+    events = get_events(calendar, start_date, end_date)
+    
+    # Формируем текст с событиями
+    period_text = "сегодня" if days == 1 else f"на {days} {'дня' if days == 3 else 'дней'}"
+    text = f"События {period_text}:\n\n"
+    text += format_events_text(events)
+    
+    # Добавляем кнопку возврата
+    keyboard = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("Назад", callback_data="back_to_main")
+    )
+    
+    try:
+        await bot.edit_message_text(
+            text,
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=keyboard
+        )
+    except MessageNotModified:
+        # Если сообщение не изменилось, игнорируем ошибку
+        pass
+
+# Обработчик для возврата в главное меню
+@dp.callback_query_handler(lambda c: c.data == 'back_to_main')
+async def process_back_to_main(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Получаем данные из базы данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        calendar = get_calendar(db)
+        has_calendar = calendar is not None
+        
+        text = "Выберите действие:"
+        await bot.edit_message_text(
+            text,
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(user, has_calendar)
+        )
+    finally:
+        db.close()
+
+# Обработчики для подписки/отписки
+@dp.callback_query_handler(lambda c: c.data == 'subscribe')
+async def process_subscribe(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Обновляем статус подписки в базе данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        # Обновляем статус подписки
+        update_user_subscription(db, user_id, True)
+        user.is_subscribed = True  # Обновляем локальный объект пользователя
+        
+        await bot.edit_message_text(
+            "Уведомления о событиях включены! Вы будете получать сообщения о начале мероприятий.",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(user, True)
+        )
+    finally:
+        db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'unsubscribe')
+async def process_unsubscribe(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Обновляем статус подписки в базе данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        # Обновляем статус подписки
+        update_user_subscription(db, user_id, False)
+        user.is_subscribed = False  # Обновляем локальный объект пользователя
+        
+        await bot.edit_message_text(
+            "Уведомления о событиях отключены.",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(user, False)
+        )
+    finally:
+        db.close()
+
+# Функция для проверки предстоящих событий и отправки уведомлений
+async def check_upcoming_events():
+    while True:
+        now = datetime.datetime.now(tz.tzlocal())
+        
+        # Проверяем события для каждого подписанного пользователя
+        for user_id, data in user_data.items():
+            if data.get('subscribed', False) and 'calendar_url' in data:
+                try:
+                    # Загружаем календарь
+                    calendar = await fetch_calendar(data['calendar_url'])
+                    if not calendar:
+                        continue
+                    
+                    # Получаем события на ближайший час
+                    end_time = now + datetime.timedelta(hours=1)
+                    events = get_events(calendar, now, end_time)
+                    
+                    # Фильтруем события, которые начинаются в течение 15 минут
+                    for event in events:
+                        event_start = event['start']
+                        time_diff = (event_start - now).total_seconds() / 60
+                        
+                        # Если событие начинается в течение заданного времени и мы еще не отправляли уведомление
+                        event_id = f"{event['summary']}_{event_start.isoformat()}"
+                        if 0 <= time_diff <= NOTIFICATION_TIME and event_id not in data.get('notified_events', set()):
+                            # Отправляем уведомление
+                            text = f"🔔 Скоро начнется событие!\n\n"
+                            text += f"🕒 {event_start.strftime('%d.%m.%Y %H:%M')}\n"
+                            text += f"📌 {event['summary']}\n"
+                            
+                            if event['location'] != 'Без места':
+                                text += f"📍 {event['location']}\n"
+                            
+                            if event['description'] != 'Без описания':
+                                text += f"ℹ️ {event['description']}\n"
+                            
+                            await bot.send_message(user_id, text)
+                            
+                            # Отмечаем событие как уведомленное
+                            if 'notified_events' not in data:
+                                data['notified_events'] = set()
+                            data['notified_events'].add(event_id)
+                except Exception as e:
+                    logging.error(f"Ошибка при проверке событий для пользователя {user_id}: {e}")
+        
+        # Очищаем старые уведомления (старше 24 часов)
+        for user_id, data in user_data.items():
+            if 'notified_events' in data:
+                # Создаем новый набор без старых событий
+                data['notified_events'] = {event_id for event_id in data['notified_events'] 
+                                          if not event_id.split('_')[1].startswith((now - datetime.timedelta(days=1)).isoformat()[:10])}
+        
+        # Ждем заданное время перед следующей проверкой
+        await asyncio.sleep(CHECK_INTERVAL)
+
+# Обработчик для управления администраторами
+@dp.callback_query_handler(lambda c: c.data == 'manage_admins')
+async def process_manage_admins(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Проверяем, является ли пользователь владельцем
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        if not user.is_owner:
+            await bot.edit_message_text(
+                "У вас нет прав для управления администраторами.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, get_calendar(db) is not None)
+            )
+            return
+        
+        # Создаем клавиатуру для управления администраторами
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            InlineKeyboardButton("Добавить администратора", callback_data="add_admin"),
+            InlineKeyboardButton("Удалить администратора", callback_data="remove_admin"),
+            InlineKeyboardButton("Назад", callback_data="back_to_main")
+        )
+        
+        await bot.edit_message_text(
+            "Управление администраторами:",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=keyboard
+        )
+    finally:
+        db.close()
+
+# Обработчик для добавления администратора
+@dp.callback_query_handler(lambda c: c.data == 'add_admin')
+async def process_add_admin(callback_query: CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Проверяем, является ли пользователь владельцем
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        if not user.is_owner:
+            await bot.edit_message_text(
+                "У вас нет прав для управления администраторами.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, get_calendar(db) is not None)
+            )
+            return
+        
+        # Запрашиваем ID нового администратора
+        await bot.edit_message_text(
+            "Пожалуйста, отправьте ID пользователя, которого хотите сделать администратором.",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("Отмена", callback_data="cancel")
+            )
+        )
+        
+        # Устанавливаем состояние ожидания ID администратора
+        await AdminStates.waiting_for_admin_id.set()
+    finally:
+        db.close()
+
+# Обработчик для получения ID нового администратора
+@dp.message_handler(state=AdminStates.waiting_for_admin_id)
+async def process_admin_id(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли пользователь владельцем
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, message.from_user.username,
+                                message.from_user.first_name, message.from_user.last_name)
+        
+        if not user.is_owner:
+            await message.answer(
+                "У вас нет прав для управления администраторами.",
+                reply_markup=get_main_keyboard(user, get_calendar(db) is not None)
+            )
+            await state.finish()
+            return
+        
+        # Проверяем корректность введенного ID
+        try:
+            admin_id = int(message.text.strip())
+        except ValueError:
+            await message.answer(
+                "Пожалуйста, введите корректный ID пользователя (целое число).",
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("Отмена", callback_data="cancel")
+                )
+            )
+            return
+        
+        # Проверяем, существует ли пользователь с таким ID
+        admin_user = get_user(db, admin_id)
+        if not admin_user:
+            # Если пользователя нет в базе, создаем его
+            admin_user = create_user(db, admin_id)
+        
+        # Назначаем пользователя администратором
+        set_user_admin(db, admin_id, True)
+        
+        await state.finish()
+        
+        # Отправляем сообщение об успешном назначении
+        await message.answer(
+            f"Пользователь с ID {admin_id} успешно назначен администратором.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("Назад к управлению", callback_data="manage_admins")
+            )
+        )
+    finally:
+        db.close()
+
+# Обработчик для удаления администратора
+@dp.callback_query_handler(lambda c: c.data == 'remove_admin')
+async def process_remove_admin(callback_query: CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Проверяем, является ли пользователь владельцем
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        if not user.is_owner:
+            await bot.edit_message_text(
+                "У вас нет прав для управления администраторами.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, get_calendar(db) is not None)
+            )
+            return
+        
+        # Запрашиваем ID администратора для удаления
+        await bot.edit_message_text(
+            "Пожалуйста, отправьте ID пользователя, у которого хотите убрать права администратора.",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("Отмена", callback_data="cancel")
+            )
+        )
+        
+        # Устанавливаем состояние ожидания ID администратора
+        await AdminStates.waiting_for_admin_id.set()
+        
+        # Сохраняем информацию о том, что это удаление администратора
+        await state.update_data(action="remove_admin")
+    finally:
+        db.close()
+
+# Обработчик для запроса доступа к календарю
+@dp.callback_query_handler(lambda c: c.data == 'request_calendar')
+async def process_request_calendar(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Получаем данные пользователя
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        # Отправляем сообщение владельцу бота
+        owner_id = OWNER_ID
+        if owner_id:
+            username = callback_query.from_user.username or "без имени пользователя"
+            full_name = f"{callback_query.from_user.first_name or ''} {callback_query.from_user.last_name or ''}".strip() or "без имени"
+            
+            await bot.send_message(
+                owner_id,
+                f"Пользователь @{username} ({full_name}, ID: {user_id}) запрашивает доступ к календарю.",
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("Сделать администратором", callback_data=f"make_admin_{user_id}")
+                )
+            )
+            
+            # Отправляем сообщение пользователю
+            await bot.edit_message_text(
+                "Запрос на доступ к календарю отправлен владельцу бота. Ожидайте ответа.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("Назад", callback_data="back_to_main")
+                )
+            )
+        else:
+            await bot.edit_message_text(
+                "Не удалось отправить запрос. Пожалуйста, свяжитесь с администратором бота напрямую.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("Назад", callback_data="back_to_main")
+                )
+            )
+    finally:
+        db.close()
+
+# Обработчик для назначения администратора из запроса
+@dp.callback_query_handler(lambda c: c.data.startswith('make_admin_'))
+async def process_make_admin_from_request(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Проверяем, является ли пользователь владельцем
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        if not user.is_owner:
+            await bot.edit_message_text(
+                "У вас нет прав для назначения администраторов.",
+                user_id,
+                callback_query.message.message_id
+            )
+            return
+        
+        # Получаем ID пользователя для назначения администратором
+        admin_id = int(callback_query.data.split('_')[2])
+        
+        # Назначаем пользователя администратором
+        admin_user = get_or_create_user(db, admin_id)
+        set_user_admin(db, admin_id, True)
+        
+        # Отправляем сообщение владельцу
+        await bot.edit_message_text(
+            f"Пользователь с ID {admin_id} успешно назначен администратором.",
+            user_id,
+            callback_query.message.message_id
+        )
+        
+        # Отправляем сообщение новому администратору
+        await bot.send_message(
+            admin_id,
+            "Вам предоставлены права администратора. Теперь вы можете управлять календарем.",
+            reply_markup=get_main_keyboard(admin_user, get_calendar(db) is not None)
+        )
+    finally:
+        db.close()
+
+# Обработчики для подписки/отписки
+@dp.callback_query_handler(lambda c: c.data == 'subscribe')
+async def process_subscribe(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Обновляем статус подписки в базе данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        # Проверяем, есть ли календарь
+        calendar = get_calendar(db)
+        if not calendar:
+            await bot.edit_message_text(
+                "Сначала добавьте календарь.",
+                user_id,
+                callback_query.message.message_id,
+                reply_markup=get_main_keyboard(user, False)
+            )
+            return
+        
+        # Обновляем статус подписки
+        update_user_subscription(db, user_id, True)
+        user.is_subscribed = True  # Обновляем локальный объект пользователя
+        
+        await bot.edit_message_text(
+            "Уведомления о событиях включены! Вы будете получать сообщения о начале мероприятий.",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(user, True)
+        )
+    finally:
+        db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'unsubscribe')
+async def process_unsubscribe(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    user_id = callback_query.from_user.id
+    
+    # Обновляем статус подписки в базе данных
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, user_id, callback_query.from_user.username,
+                                callback_query.from_user.first_name, callback_query.from_user.last_name)
+        
+        # Обновляем статус подписки
+        update_user_subscription(db, user_id, False)
+        user.is_subscribed = False  # Обновляем локальный объект пользователя
+        
+        await bot.edit_message_text(
+            "Уведомления о событиях отключены.",
+            user_id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(user, True)
+        )
+    finally:
+        db.close()
+
+# Функция для проверки предстоящих событий и отправки уведомлений
+async def check_upcoming_events():
+    while True:
+        now = datetime.datetime.now(tz.tzlocal())
+        
+        # Получаем всех подписанных пользователей и календарь из базы данных
+        db = SessionLocal()
+        try:
+            # Получаем календарь
+            calendar_obj = get_calendar(db)
+            if not calendar_obj:
+                # Если календаря нет, пропускаем проверку
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            
+            # Загружаем календарь
+            calendar = await fetch_calendar(calendar_obj.url)
+            if not calendar:
+                # Если не удалось загрузить календарь, пропускаем проверку
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            
+            # Получаем всех подписанных пользователей
+            subscribed_users = get_all_subscribed_users(db)
+            
+            # Получаем события на ближайший час
+            end_time = now + datetime.timedelta(hours=1)
+            events = get_events(calendar, now, end_time)
+            
+            # Создаем словарь для отслеживания уведомлений
+            notified_events = {}
+            
+            # Отправляем уведомления подписанным пользователям
+            for user in subscribed_users:
+                user_id = user.user_id
+                
+                # Если у пользователя нет словаря уведомлений, создаем его
+                if user_id not in notified_events:
+                    notified_events[user_id] = set()
+                
+                # Фильтруем события, которые начинаются в течение заданного времени
+                for event in events:
+                    event_start = event['start']
+                    time_diff = (event_start - now).total_seconds() / 60
+                    
+                    # Если событие начинается в течение заданного времени и мы еще не отправляли уведомление
+                    event_id = f"{event['summary']}_{event_start.isoformat()}"
+                    if 0 <= time_diff <= NOTIFICATION_TIME and event_id not in notified_events[user_id]:
+                        # Отправляем уведомление
+                        text = f"🔔 Скоро начнется событие!\n\n"
+                        text += f"🕒 {event_start.strftime('%d.%m.%Y %H:%M')}\n"
+                        text += f"📌 {event['summary']}\n"
+                        
+                        if event['location'] != 'Без места':
+                            text += f"📍 {event['location']}\n"
+                        
+                        if event['description'] != 'Без описания':
+                            text += f"ℹ️ {event['description']}\n"
+                        
+                        try:
+                            await bot.send_message(user_id, text)
+                            # Отмечаем событие как уведомленное
+                            notified_events[user_id].add(event_id)
+                        except Exception as e:
+                            logging.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
+            
+            # Очищаем старые уведомления (старше 24 часов)
+            for user_id in notified_events:
+                notified_events[user_id] = {event_id for event_id in notified_events[user_id] 
+                                          if not event_id.split('_')[1].startswith((now - datetime.timedelta(days=1)).isoformat()[:10])}
+        
+        except Exception as e:
+            logging.error(f"Ошибка при проверке событий: {e}")
+        finally:
+            db.close()
+        
+        # Ждем заданное время перед следующей проверкой
+        await asyncio.sleep(CHECK_INTERVAL)
+
+# Запуск бота
+async def main():
+    # Запускаем задачу проверки событий
+    asyncio.create_task(check_upcoming_events())
+    
+    # Запускаем бота
+    await dp.start_polling()
+
+if __name__ == '__main__':
+    asyncio.run(main())
